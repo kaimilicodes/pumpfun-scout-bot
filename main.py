@@ -29,9 +29,30 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
 
 PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
 OBSERVATION_WINDOW_SEC = 90
-MIN_UNIQUE_BUYERS = 8
-MIN_BUY_VOLUME_SOL = 5.0
-MIN_BUY_SELL_RATIO = 1.5
+
+# Sensitivity tiers, selectable in Telegram via /tier. These are NOT
+# scientific predictions that a token will actually hit that multiple —
+# they're just stricter/looser versions of the same momentum filter.
+TIER_PRESETS = {
+    "2x":  {"min_buyers": 4,  "min_volume_sol": 1.5,  "min_ratio": 1.1},
+    "5x":  {"min_buyers": 6,  "min_volume_sol": 3.0,  "min_ratio": 1.3},
+    "10x": {"min_buyers": 8,  "min_volume_sol": 5.0,  "min_ratio": 1.5},
+    "20x": {"min_buyers": 12, "min_volume_sol": 8.0,  "min_ratio": 1.8},
+    "30x": {"min_buyers": 15, "min_volume_sol": 12.0, "min_ratio": 2.0},
+    "40x": {"min_buyers": 18, "min_volume_sol": 16.0, "min_ratio": 2.2},
+    "50x": {"min_buyers": 22, "min_volume_sol": 20.0, "min_ratio": 2.5},
+}
+
+active_tier = {"name": "10x", **TIER_PRESETS["10x"]}
+
+TIER_KEYBOARD_MARKUP = {
+    "inline_keyboard": [
+        [{"text": t, "callback_data": f"tier_{t}"} for t in ["2x", "5x", "10x"]],
+        [{"text": t, "callback_data": f"tier_{t}"} for t in ["20x", "30x", "40x"]],
+        [{"text": "50x", "callback_data": "tier_50x"}],
+    ]
+}
+
 NAME_BLOCKLIST_SUBSTRINGS = ["test", "scam", "airdrop claim"]
 MAX_TRACKED_TOKENS = 500
 SEND_ACTIVITY_LOG_TO_TELEGRAM = False
@@ -40,8 +61,12 @@ RECENT_HISTORY_MAX = 30
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pumpfun_scout")
 
+CLOSE_BUTTON_MARKUP = {
+    "inline_keyboard": [[{"text": "❌ Close", "callback_data": "close"}]]
+}
 
-def send_telegram_message(text: str) -> None:
+
+def send_telegram_message(text: str, with_close_button: bool = False) -> None:
     if "PUT_YOUR" in TELEGRAM_BOT_TOKEN or "PUT_YOUR" in TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured — printing alert instead:\n%s", text)
         return
@@ -52,12 +77,30 @@ def send_telegram_message(text: str) -> None:
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
+    if with_close_button:
+        payload["reply_markup"] = json.dumps(CLOSE_BUTTON_MARKUP)
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code != 200:
             log.error("Telegram send failed: %s %s", resp.status_code, resp.text)
     except requests.RequestException as e:
         log.error("Telegram send exception: %s", e)
+
+
+def delete_telegram_message(chat_id, message_id) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "message_id": message_id}, timeout=10)
+    except requests.RequestException as e:
+        log.error("Telegram delete exception: %s", e)
+
+
+def answer_callback_query(callback_query_id: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    try:
+        requests.post(url, json={"callback_query_id": callback_query_id}, timeout=10)
+    except requests.RequestException as e:
+        log.error("Telegram answerCallbackQuery exception: %s", e)
 
 
 @dataclass
@@ -93,18 +136,18 @@ def is_name_blocked(name: str, symbol: str) -> bool:
 def evaluate_token(state: TokenState) -> Optional[str]:
     if state.alerted:
         return None
-    if len(state.buyers) < MIN_UNIQUE_BUYERS:
+    if len(state.buyers) < active_tier["min_buyers"]:
         return None
-    if state.buy_volume_sol < MIN_BUY_VOLUME_SOL:
+    if state.buy_volume_sol < active_tier["min_volume_sol"]:
         return None
-    if state.buy_sell_ratio() < MIN_BUY_SELL_RATIO:
+    if state.buy_sell_ratio() < active_tier["min_ratio"]:
         return None
 
     state.alerted = True
     pumpfun_link = f"https://pump.fun/{state.mint}"
     solscan_link = f"https://solscan.io/token/{state.mint}"
     return (
-        f"🚨 *Early momentum flag* 🚨\n"
+        f"🚨 *Early momentum flag ({active_tier['name']} filter)* 🚨\n"
         f"*{state.name}* (${state.symbol})\n"
         f"Age: {int(state.age())}s\n"
         f"Buy volume: {state.buy_volume_sol:.2f} SOL\n"
@@ -169,7 +212,7 @@ async def handle_trade(msg: dict) -> None:
 
     alert = evaluate_token(state)
     if alert:
-        send_telegram_message(alert)
+        send_telegram_message(alert, with_close_button=True)
 
 
 async def run_bot() -> None:
@@ -212,6 +255,28 @@ async def _reconnecting_websocket(url: str, retry_delay: int = 5):
             await asyncio.sleep(retry_delay)
 
 
+def send_tier_picker() -> None:
+    if "PUT_YOUR" in TELEGRAM_BOT_TOKEN or "PUT_YOUR" in TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured — cannot send tier picker.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": (
+            f"Pick a filter strength (current: *{active_tier['name']}*).\n"
+            f"Higher = stricter filter, not a guaranteed multiple."
+        ),
+        "parse_mode": "Markdown",
+        "reply_markup": json.dumps(TIER_KEYBOARD_MARKUP),
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            log.error("Telegram send failed: %s %s", resp.status_code, resp.text)
+    except requests.RequestException as e:
+        log.error("Telegram send exception: %s", e)
+
+
 def build_recent_message() -> str:
     if not recent_history:
         return "No tokens scanned yet — still watching."
@@ -247,6 +312,34 @@ async def telegram_command_listener() -> None:
             updates = await asyncio.to_thread(_fetch_telegram_updates, next_offset)
             for update in updates:
                 next_offset = update["update_id"] + 1
+
+                callback = update.get("callback_query")
+                if callback:
+                    cb_chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+                    data = callback.get("data", "")
+                    if cb_chat_id != str(TELEGRAM_CHAT_ID):
+                        continue
+
+                    if data == "close":
+                        message_id = callback.get("message", {}).get("message_id")
+                        await asyncio.to_thread(delete_telegram_message, cb_chat_id, message_id)
+                        await asyncio.to_thread(answer_callback_query, callback.get("id"))
+                    elif data.startswith("tier_"):
+                        tier_name = data[len("tier_"):]
+                        if tier_name in TIER_PRESETS:
+                            active_tier["name"] = tier_name
+                            active_tier.update(TIER_PRESETS[tier_name])
+                            send_telegram_message(
+                                f"🎯 Filter set to *{tier_name}*.\n"
+                                f"Min buyers: {active_tier['min_buyers']} | "
+                                f"Min volume: {active_tier['min_volume_sol']} SOL | "
+                                f"Min buy/sell ratio: {active_tier['min_ratio']}x\n\n"
+                                f"Reminder: this doesn't guarantee a {tier_name} outcome — "
+                                f"it just changes how strict the momentum filter is."
+                            )
+                        await asyncio.to_thread(answer_callback_query, callback.get("id"))
+                    continue
+
                 message = update.get("message") or update.get("edited_message") or {}
                 chat_id = str(message.get("chat", {}).get("id", ""))
                 text = (message.get("text") or "").strip()
@@ -256,9 +349,14 @@ async def telegram_command_listener() -> None:
 
                 if text.startswith("/recent"):
                     send_telegram_message(build_recent_message())
+                elif text.startswith("/tier"):
+                    await asyncio.to_thread(send_tier_picker)
                 elif text.startswith("/start") or text.startswith("/help"):
                     send_telegram_message(
-                        "Commands:\n/recent — show the last tokens scanned"
+                        "Commands:\n"
+                        "/recent — show the last tokens scanned\n"
+                        "/tier — choose how strict the momentum filter is (2x–50x)\n\n"
+                        f"Current filter: *{active_tier['name']}*"
                     )
         except Exception as e:
             log.error("Telegram command listener error: %s", e)
